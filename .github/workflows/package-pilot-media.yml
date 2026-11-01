@@ -9,11 +9,11 @@ permissions:
 
 jobs:
   package:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
 
       - name: Verify source videos
         run: |
@@ -22,7 +22,7 @@ jobs:
           ls -lh "dy/sc/孙悟空VS至尊宝/PILOT/"*.mp4
 
       - name: Upload pilot videos
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pilot-media
           path: |
