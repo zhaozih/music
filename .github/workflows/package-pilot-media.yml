@@ -1,0 +1,32 @@
+
+name: Package Pilot Media
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Verify source videos
+        run: |
+          test -s "dy/sc/孙悟空VS至尊宝/PILOT/PILOT-01-视频.mp4"
+          test -s "dy/sc/孙悟空VS至尊宝/PILOT/PILOT-03-视频.mp4"
+          ls -lh "dy/sc/孙悟空VS至尊宝/PILOT/"*.mp4
+
+      - name: Upload pilot videos
+        uses: actions/upload-artifact@v7
+        with:
+          name: pilot-media
+          path: |
+            dy/sc/孙悟空VS至尊宝/PILOT/PILOT-01-视频.mp4
+            dy/sc/孙悟空VS至尊宝/PILOT/PILOT-03-视频.mp4
+          if-no-files-found: error
+          retention-days: 7
