@@ -30,3 +30,18 @@ jobs:
             dy/sc/孙悟空VS至尊宝/PILOT/PILOT-03-视频.mp4
           if-no-files-found: error
           retention-days: 7
+
+      - name: Verify character reference PNGs
+        run: |
+          test -d "dy/sc/孙悟空VS至尊宝/人物母图"
+          find "dy/sc/孙悟空VS至尊宝/人物母图" -maxdepth 1 -type f -iname '*.png' -print
+          test "$(find "dy/sc/孙悟空VS至尊宝/人物母图" -maxdepth 1 -type f -iname '*.png' | wc -l)" -gt 0
+
+      - name: Upload character reference PNGs
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: character-reference-pngs
+          path: dy/sc/孙悟空VS至尊宝/人物母图/*.png
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
