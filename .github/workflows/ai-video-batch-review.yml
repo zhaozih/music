@@ -1,0 +1,260 @@
+name: AI Video Batch Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_dir:
+        description: 'Repository folder containing MP4 videos (recursive)'
+        required: true
+        type: string
+        default: 'dy/reference'
+      frame_mode:
+        description: 'Frames per second, or every original frame'
+        required: true
+        type: choice
+        default: '5'
+        options:
+          - '5'
+          - '10'
+          - 'original'
+
+# This workflow deliberately does NOT create public Releases of third-party videos.
+# Authorized ChatGPT GitHub access can download the private Actions artifacts.
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Discover source videos
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+    steps:
+      - name: Checkout repository tree
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Discover MP4 files and build batch index
+        id: find
+        shell: bash
+        env:
+          VIDEO_DIR: ${{ inputs.video_dir }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          root = pathlib.Path.cwd().resolve()
+          raw = os.environ['VIDEO_DIR'].strip()
+          folder = pathlib.Path(raw)
+          if not raw or folder.is_absolute() or '..' in folder.parts:
+              sys.exit(f'Invalid repository-relative directory: {raw!r}')
+          folder = (root / folder).resolve()
+          if not folder.is_relative_to(root) or not folder.is_dir():
+              sys.exit(f'Video directory does not exist in this checkout: {raw}')
+          files = sorted((p for p in folder.rglob('*') if p.is_file() and p.suffix.lower()=='.mp4'), key=lambda p: p.as_posix())
+          files = [p for p in files if not p.is_symlink() and p.resolve().is_relative_to(root)]
+          if not files:
+              sys.exit(f'No .mp4 files found under: {raw}')
+          if len(files) > 20:
+              sys.exit(f'Found {len(files)} videos; limit is 20 per run to control size and time')
+          items = [{'id': f'V{i:03d}', 'path': p.relative_to(root).as_posix()} for i, p in enumerate(files, 1)]
+          payload = {'include': items}
+          index = {'source_commit': os.environ['SOURCE_SHA'], 'run_id': os.environ['RUN_ID'],
+                   'directory': raw, 'video_count': len(items), 'videos': items}
+          pathlib.Path('batch-output').mkdir(exist_ok=True)
+          pathlib.Path('batch-output/batch-index.json').write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding='utf-8')
+          md = ['# Reference video batch', '', f'Source directory: `{raw}`',
+                f'Source commit: `{os.environ["SOURCE_SHA"]}`', '', '| ID | Video path |', '|---|---|']
+          md += [f'| {v["id"]} | `{v["path"]}` |' for v in items]
+          pathlib.Path('batch-output/batch-index.md').write_text('\n'.join(md)+'\n', encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write('matrix='+json.dumps(payload, ensure_ascii=True, separators=(',', ':'))+'\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('\n'.join(md)+'\n')
+          print(f'Discovered {len(items)} videos:')
+          for v in items: print(f'  {v["id"]} {v["path"]}')
+          PY
+
+      - name: Upload batch index
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: reference-batch-index-${{ github.run_id }}-${{ github.run_attempt }}
+          path: batch-output/
+          if-no-files-found: error
+          retention-days: 14
+
+  process:
+    name: Review ${{ matrix.id }}
+    needs: discover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout source with LFS
+        uses: actions/checkout@v7.0.1
+        with:
+          lfs: true
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install processing tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          python -m pip install --quiet 'Pillow>=10,<13'
+
+      - name: Validate video, extract video frames and audio
+        shell: bash
+        env:
+          VIDEO_PATH: ${{ matrix.path }}
+          VIDEO_ID: ${{ matrix.id }}
+          FRAME_MODE: ${{ inputs.frame_mode }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, pathlib, sys
+          root = pathlib.Path.cwd().resolve()
+          path = pathlib.Path(os.environ['VIDEO_PATH'])
+          if path.is_absolute() or '..' in path.parts or path.suffix.lower() != '.mp4':
+              sys.exit('Invalid video path')
+          path = (root / path).resolve()
+          if not path.is_relative_to(root) or not path.is_file() or not path.stat().st_size:
+              sys.exit('Video file missing or empty in checked-out branch')
+          with path.open('rb') as f:
+              if f.read(80).startswith(b'version https://git-lfs.github.com/spec/v1'):
+                  sys.exit('Only Git LFS pointer found, not actual video (check LFS quota/permissions)')
+          h = hashlib.sha256()
+          with path.open('rb') as f:
+              for block in iter(lambda: f.read(1024*1024), b''): h.update(block)
+          pathlib.Path('review/frames').mkdir(parents=True, exist_ok=True)
+          pathlib.Path('review/sheets').mkdir(parents=True, exist_ok=True)
+          pathlib.Path('review/video-identity.json').write_text(json.dumps({
+              'id': os.environ['VIDEO_ID'], 'source_path': os.environ['VIDEO_PATH'],
+              'video_sha256': h.hexdigest(), 'byte_size': path.stat().st_size,
+              'frame_mode': os.environ['FRAME_MODE']}, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(f'Processing {os.environ["VIDEO_ID"]}: {os.environ["VIDEO_PATH"]}, {path.stat().st_size:,} bytes')
+          PY
+
+          ffprobe -v error -show_entries \
+            format=duration,size,format_name,start_time:stream=index,codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate \
+            -of json "$VIDEO_PATH" > review/metadata.json
+
+          if [[ "$FRAME_MODE" == 'original' ]]; then
+            VF='showinfo'
+          else
+            VF="fps=${FRAME_MODE},scale=960:-2,showinfo"
+          fi
+          ffmpeg -hide_banner -nostdin -nostats -loglevel info -i "$VIDEO_PATH" \
+            -map 0:v:0 -vf "$VF" -fps_mode passthrough \
+            -start_number 0 -q:v 3 'review/frames/frame_%06d.jpg' \
+            2> review/ffmpeg-frames.log
+
+          if ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$VIDEO_PATH" | grep -q .; then
+            ffmpeg -hide_banner -nostdin -loglevel error -i "$VIDEO_PATH" \
+              -map 0:a:0 -vn -c:a aac -b:a 160k -ac 2 review/audio.m4a
+          fi
+
+      - name: Generate contact sheets, exact time index and manifest
+        shell: bash
+        env:
+          VIDEO_PATH: ${{ matrix.path }}
+          VIDEO_ID: ${{ matrix.id }}
+          FRAME_MODE: ${{ inputs.frame_mode }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, math, os, pathlib, re
+          from PIL import Image, ImageDraw, ImageFont, ImageOps
+          root = pathlib.Path('review')
+          frames = sorted((root/'frames').glob('frame_*.jpg'))
+          if not frames or len(frames) > 12000:
+              raise RuntimeError(f'Invalid frame count {len(frames)} (must be 1-12000). Use 5/10 fps or split source.')
+          rx = re.compile(r'\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:\s*([-+\d.eE]+)')
+          indexed = {}
+          for line in (root/'ffmpeg-frames.log').read_text(errors='replace').splitlines():
+              m = rx.search(line)
+              if m:
+                  idx = int(m.group(1))
+                  if idx in indexed: raise RuntimeError(f'Duplicate timecode for frame {idx}')
+                  indexed[idx] = float(m.group(3))
+          if set(indexed) != set(range(len(frames))):
+              raise RuntimeError(f'Timestamp mismatch: {len(indexed)} times for {len(frames)} frames')
+          pts = [indexed[i] for i in range(len(frames))]
+          relative = [max(0., t-pts[0]) for t in pts]
+          def hms(t):
+              n = round(t*1000)
+              h, n = divmod(n, 3600000)
+              m, n = divmod(n, 60000)
+              s, ms = divmod(n, 1000)
+              return f'{h:02d}:{m:02d}:{s:02d}.{ms:03d}'
+          with (root/'frame-index.csv').open('w', newline='', encoding='utf-8-sig') as f:
+              w = csv.writer(f)
+              w.writerow(['file','zero_based_frame','seconds_from_first_exported_frame','ffmpeg_pts_seconds','timecode'])
+              for i, p in enumerate(frames):
+                  w.writerow([p.name, i, f'{relative[i]:.6f}', f'{pts[i]:.6f}', hms(relative[i])])
+          meta = json.loads((root/'metadata.json').read_text())
+          video = next((s for s in meta['streams'] if s['codec_type']=='video'), None)
+          if not video: raise RuntimeError('No video stream found')
+          portrait = video['height'] > video['width']
+          cols, rows = 3, 3
+          tile_w, tile_h = (330, 520) if portrait else (510, 340)
+          font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 18)
+          def sheet(indices, output):
+              im = Image.new('RGB', (cols*tile_w, rows*tile_h), '#121418')
+              d = ImageDraw.Draw(im)
+              for j, idx in enumerate(indices):
+                  x, y = (j%cols)*tile_w, (j//cols)*tile_h
+                  with Image.open(frames[idx]) as frame:
+                      thumb = ImageOps.contain(frame.convert('RGB'), (tile_w-12, tile_h-42))
+                  im.paste(thumb, (x+(tile_w-thumb.width)//2, y+5))
+                  d.text((x+6, y+tile_h-30), f'F{idx:06d} {hms(relative[idx])}', font=font, fill='white')
+              im.save(output, quality=88)
+          per = cols * rows
+          for k, start in enumerate(range(0,len(frames),per), 1):
+              sheet(list(range(start, min(start+per,len(frames)))), root/'sheets'/f'sheet_{k:04d}.jpg')
+          choices = [0] if len(frames)==1 else sorted(set(round(i*(len(frames)-1)/(per-1)) for i in range(per)))
+          sheet(choices, root/'overview.jpg')
+          ident = json.loads((root/'video-identity.json').read_text())
+          ident.update({'source_commit': os.environ['SOURCE_SHA'], 'frame_count': len(frames),
+                        'sheet_count': math.ceil(len(frames)/per), 'source_width': video['width'],
+                        'source_height': video['height'], 'source_duration_seconds':meta['format'].get('duration'),
+                        'timecode_note':'Relative to first exported frame. 5/10 fps showinfo PTS follow sampled frame grid.'})
+          (root/'manifest.json').write_text(json.dumps(ident, ensure_ascii=False, indent=2),encoding='utf-8')
+          pathlib.Path(root/'README.txt').write_text(
+              'This artifact belongs to ONE video, identified by manifest.json and SHA-256.\n'
+              'View overview.jpg and sheets/ first. Frames are in frames/ and timecodes in frame-index.csv.\n'
+              'Audio track, if present, is audio.m4a. 5/10fps image width=960px; original mode preserves source dimensions.\n',
+              encoding='utf-8')
+          print(f'{ident["id"]}: {len(frames)} frames, {ident["sheet_count"]} sheets, sha256={ident["video_sha256"]}')
+          PY
+
+      - name: Upload this video's private Actions artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: reference-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: review/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Add review link to run summary
+        shell: bash
+        env:
+          VIDEO_PATH: ${{ matrix.path }}
+          VIDEO_ID: ${{ matrix.id }}
+        run: |
+          printf '\n- **%s** `%s` — artifact: `reference-%s-%s-%s`\n' \
+            "$VIDEO_ID" "$VIDEO_PATH" "$VIDEO_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_STEP_SUMMARY"
