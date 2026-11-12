@@ -1,0 +1,232 @@
+name: AI Video Frame Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_path:
+        description: 'MP4 path inside the repository'
+        required: true
+        type: string
+        default: 'dy/ls/盐/盐命.mp4'
+      frame_mode:
+        description: 'Extract 5 fps, 10 fps, or all original frames'
+        required: true
+        type: choice
+        default: '5'
+        options:
+          - '5'
+          - '10'
+          - 'original'
+
+permissions:
+  contents: write   # Required only for publishing a GitHub Release.
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source, including Git LFS
+        uses: actions/checkout@v7.0.1
+        with:
+          lfs: true
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install image and video tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          python -m pip install --quiet 'Pillow>=10,<13'
+
+      - name: Validate source video and extract frames
+        shell: bash
+        env:
+          VIDEO_PATH: ${{ inputs.video_path }}
+          FRAME_MODE: ${{ inputs.frame_mode }}
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os, pathlib, sys
+          raw = os.environ['VIDEO_PATH']
+          path = pathlib.Path(raw)
+          root = pathlib.Path.cwd().resolve()
+          if path.is_absolute() or '..' in path.parts or path.suffix.lower() != '.mp4':
+              sys.exit(f'Invalid repository-relative MP4 path: {raw}')
+          if not path.is_file() or path.stat().st_size == 0:
+              sys.exit(f'MP4 not found or empty on checked-out branch: {raw}')
+          if not path.resolve().is_relative_to(root):
+              sys.exit('Source file must be located inside the repository')
+          with path.open('rb') as f:
+              if f.read(64).startswith(b'version https://git-lfs.github.com/spec/v1'):
+                  sys.exit('Source is a Git LFS pointer, not an actual MP4. Check LFS permissions/quota.')
+          print(f'Source video verified: {raw} ({path.stat().st_size:,} bytes)')
+          PY
+
+          mkdir -p review/frames review/sheets review/export
+          ffprobe -v error -show_entries \
+            format=duration,size,format_name,start_time:stream=index,codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate \
+            -of json "$VIDEO_PATH" > review/metadata.json
+
+          if [[ "$FRAME_MODE" == 'original' ]]; then
+            VIDEO_FILTER='showinfo'  # Preserve full source resolution for true frame-by-frame inspection.
+          else
+            VIDEO_FILTER="fps=${FRAME_MODE},scale=960:-2,showinfo"
+          fi
+
+          # The showinfo filter logs the timestamp of every frame actually exported.
+          # -fps_mode passthrough prevents the image sequence writer adding duplicates.
+          ffmpeg -hide_banner -nostdin -nostats -loglevel info -i "$VIDEO_PATH" \
+            -map 0:v:0 -vf "$VIDEO_FILTER" -fps_mode passthrough \
+            -start_number 0 -q:v 2 'review/frames/frame_%06d.jpg' \
+            2> review/frame_timestamps.log
+
+          if ffprobe -v error -show_entries stream=codec_type \
+            -of csv=p=0 "$VIDEO_PATH" | grep -qx audio; then
+            ffmpeg -hide_banner -nostdin -loglevel error -i "$VIDEO_PATH" \
+              -map 0:a:0 -vn -c:a aac -b:a 160k -ac 2 review/audio.m4a
+          fi
+          echo "Extracted $(find review/frames -maxdepth 1 -name 'frame_*.jpg' | wc -l) frames"
+
+      - name: Build time-indexed contact sheets and review packages
+        shell: bash
+        env:
+          FRAME_MODE: ${{ inputs.frame_mode }}
+          VIDEO_PATH: ${{ inputs.video_path }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, math, os, pathlib, re, zipfile
+          from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+          root = pathlib.Path('review')
+          frames = sorted((root/'frames').glob('frame_*.jpg'))
+          if not frames:
+              raise RuntimeError('No frames extracted: check FFmpeg log and source video')
+          if len(frames) > 12000:
+              raise RuntimeError('Over 12,000 frames. Select 5/10 fps or split the video first.')
+
+          # Collect exactly the timestamps produced by FFmpeg, not guessed n/fps values.
+          rx = re.compile(r'\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:\s*([-+\d.eE]+)')
+          indexed = {}
+          for line in (root/'frame_timestamps.log').read_text(errors='replace').splitlines():
+              match = rx.search(line)
+              if match:
+                  index, time = int(match.group(1)), float(match.group(3))
+                  if index in indexed:
+                      raise RuntimeError(f'Duplicate timecode for frame {index}')
+                  indexed[index] = time
+          if set(indexed) != set(range(len(frames))):
+              raise RuntimeError(f'Frame/timecode mismatch: got {len(indexed)} timestamps and {len(frames)} frames')
+          absolute = [indexed[i] for i in range(len(frames))]
+          times = [max(0.0, t-absolute[0]) for t in absolute]
+
+          def hms(t):
+              n = round(t*1000)
+              h, n = divmod(n, 3600000)
+              m, n = divmod(n, 60000)
+              s, ms = divmod(n, 1000)
+              return f'{h:02d}:{m:02d}:{s:02d}.{ms:03d}'
+
+          with (root/'frame_index.csv').open('w', newline='', encoding='utf-8-sig') as f:
+              writer = csv.writer(f)
+              writer.writerow(['frame_file','frame_number_zero_based',
+                               'time_from_first_frame_seconds','filter_output_pts_seconds','timecode'])
+              for i, p in enumerate(frames):
+                  writer.writerow([p.name, i, f'{times[i]:.6f}', f'{absolute[i]:.6f}', hms(times[i])])
+
+          meta = json.loads((root/'metadata.json').read_text())
+          vstream = next((s for s in meta['streams'] if s['codec_type']=='video'), None)
+          if not vstream:
+              raise RuntimeError('Video stream missing from ffprobe metadata')
+          portrait = vstream['height'] > vstream['width']
+          # Fewer, larger thumbnails for vertical shorts: faces remain more legible.
+          cols, rows = 3, 3
+          tile_w, tile_h = (420, 650) if portrait else (640, 410)
+          per_sheet = cols * rows
+          font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf'
+          font = ImageFont.truetype(font_path, 23)
+          def draw_sheet(indices, target):
+              sheet = Image.new('RGB', (cols*tile_w, rows*tile_h), (18,20,24))
+              draw = ImageDraw.Draw(sheet)
+              for j, i in enumerate(indices):
+                  p = frames[i]
+                  x, y = (j%cols)*tile_w, (j//cols)*tile_h
+                  with Image.open(p) as im:
+                      thumb = ImageOps.contain(im.convert('RGB'), (tile_w-12,tile_h-56))
+                  sheet.paste(thumb, (x+(tile_w-thumb.width)//2, y+6))
+                  draw.text((x+8,y+tile_h-41), f'F{i:06d} | {hms(times[i])}', font=font, fill='white')
+              sheet.save(target, quality=90)
+
+          for sheet_no, start in enumerate(range(0,len(frames),per_sheet), 1):
+              draw_sheet(list(range(start, min(start+per_sheet,len(frames)))),
+                         root/'sheets'/f'sheet_{sheet_no:04d}.jpg')
+
+          # Individual overview image can be previewed without unpacking a ZIP.
+          if len(frames) == 1:
+              choices = [0]
+          else:
+              choices = sorted(set(round(i*(len(frames)-1)/(per_sheet-1)) for i in range(per_sheet)))
+          draw_sheet(choices, root/'export'/'overview.jpg')
+
+          manifest = dict(source_path=os.environ['VIDEO_PATH'], source_sha=os.environ['GIT_SHA'],
+                          frame_mode=os.environ['FRAME_MODE'], frame_count=len(frames),
+                          sheet_count=math.ceil(len(frames)/per_sheet),
+                          source_width=vstream.get('width'),source_height=vstream.get('height'),
+                          exported_width=(vstream.get('width') if os.environ['FRAME_MODE']=='original' else 960),
+                          timestamp_note='time_from_first_frame is relative to the first exported frame; filter_output_pts is FFmpeg showinfo pts_time (sample-grid time in 5/10 fps mode).')
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          with zipfile.ZipFile(root/'export'/'review-summary.zip','w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for filename in ['manifest.json','metadata.json','frame_index.csv','audio.m4a']:
+                  p=root/filename
+                  if p.exists(): z.write(p,p.name)
+              for p in sorted((root/'sheets').glob('*.jpg')):
+                  z.write(p,f'contact_sheets/{p.name}')
+              z.writestr('README.txt',
+                         'Use overview.jpg for first pass, review-summary.zip for contact sheets and time index, '
+                         'and frames-part ZIPs for detailed frames. 5/10 fps frames use 960 px width; original mode keeps source resolution.\n')
+
+          batch = 150
+          for start in range(0,len(frames),batch):
+              target = root/'export'/f'frames-part-{start//batch+1:03d}.zip'
+              with zipfile.ZipFile(target,'w',zipfile.ZIP_STORED) as z:
+                  for p in frames[start:start+batch]:
+                      z.write(p,f'frames/{p.name}')
+          print(f'Extracted {len(frames)} frames in {math.ceil(len(frames)/per_sheet)} sheets.')
+          PY
+
+      - name: Upload Actions artifact (7 days)
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ai-video-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: review/export/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Publish shareable GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIDEO_PATH: ${{ inputs.video_path }}
+          TAG: ai-video-review-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          printf 'Video: `%s`\nExtraction: `%s`\nRun ID: `%s` / Attempt: `%s`\n\nPublic downloadable review assets.\n' \
+            "$VIDEO_PATH" '${{ inputs.frame_mode }}' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            > review/release-notes.md
+          gh release create "$TAG" review/export/* \
+            --title "AI Video Review ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT})" \
+            --notes-file review/release-notes.md --target "$GITHUB_SHA" --latest=false
+          {
+            echo '### Review assets'
+            echo "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
