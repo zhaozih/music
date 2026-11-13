@@ -7,7 +7,12 @@ on:
         description: 'Repository-relative work directory under dy/reference, containing 视频/ and public analysis'
         type: string
         required: true
-        default: 'dy/reference/老布褶也/是花都会开，没开是因为有人介入'
+        default: 'dy/reference/老布褶也/是花都会开，没开是因为有人介入 #未来导演扶持计划 #老布'
+      video_path:
+        description: 'Optional repository-relative MP4 path, leave blank for automatic title matching'
+        type: string
+        required: false
+        default: ''
       frame_mode:
         description: 'Frames per second'
         type: choice
@@ -47,8 +52,9 @@ jobs:
         env:
           WORK_DIR: ${{ inputs.work_dir }}
           FRAME_MODE: ${{ inputs.frame_mode }}
+          VIDEO_PATH: ${{ inputs.video_path }}
         run: |
-          python scripts/build_one_evidence.py --work-dir "$WORK_DIR" --frame-mode "$FRAME_MODE" --out evidence-output
+          python scripts/build_one_evidence.py --work-dir "$WORK_DIR" --video-path "$VIDEO_PATH" --frame-mode "$FRAME_MODE" --out evidence-output
 
       - name: Upload Actions artifact (no public Release)
         uses: actions/upload-artifact@v4

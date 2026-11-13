@@ -27,6 +27,81 @@ def inside(path,root):
     return path.resolve().is_relative_to(root.resolve())
 
 
+def resolve_work_dir(repo, base, raw):
+    """Require a real per-work directory; auto-complete only a unique missing title suffix."""
+    requested = Path(raw)
+    if requested.is_absolute() or '..' in requested.parts:
+        raise SystemExit(f'Invalid relative work_dir: {raw!r}')
+    wd = (repo / requested).resolve()
+    if not inside(wd,base) or wd == base:
+        raise SystemExit('work_dir must be a child of dy/reference')
+    if wd.is_dir():
+        return wd
+    # The V1 workflow shipped a truncated default omitting hashtags.  If exactly
+    # one existing title starts with the given string, resolve it safely.
+    if wd.parent.is_dir() and inside(wd.parent,base) and wd.parent != base:
+        matches = sorted([p for p in wd.parent.iterdir()
+                          if p.is_dir() and not p.is_symlink() and p.name.startswith(wd.name)])
+        if len(matches) == 1:
+            print(f'[WORK_DIR] Completed unique folder prefix: {matches[0].relative_to(repo)}',flush=True)
+            return matches[0]
+        if len(matches)>1:
+            opts='\n'.join('  '+p.relative_to(repo).as_posix() for p in matches)
+            raise SystemExit('Ambiguous work_dir; enter exact title folder:\n'+opts)
+    available=[]
+    if wd.parent.is_dir():
+        available=['  '+p.name for p in sorted(wd.parent.iterdir()) if p.is_dir()]
+    raise SystemExit(f'Work folder not found: {raw}\n' +
+                     ('Available folders:\n'+'\n'.join(available) if available else
+                      'Check dy/reference/<account>/<exact title folder>.'))
+
+
+def normalize_title(text):
+    # Filename and exported folder title may have different whitespace/hashtags.
+    import unicodedata
+    text=unicodedata.normalize('NFKC',str(text or '')).casefold()
+    return re.sub(r'[^\w]+','',text,flags=re.UNICODE).replace('_','')
+
+
+def select_video(repo, base, wd, public_info, video_arg=''):
+    """Safe unique matching: work/video first, then account-root legacy MP4s."""
+    def safe_mp4_files(directory):
+        if not directory.is_dir():return []
+        return sorted(p for p in directory.iterdir()
+                      if p.is_file() and p.suffix.lower()=='.mp4'
+                      and not p.is_symlink() and inside(p,base) and p.stat().st_size>0)
+    if video_arg:
+        relative=Path(video_arg)
+        if relative.is_absolute() or '..' in relative.parts:raise SystemExit('--video-path must be repository-relative')
+        video=(repo/relative).resolve()
+        if not inside(video,base) or not video.is_file() or video.suffix.lower()!='.mp4' or video.is_symlink():
+            raise SystemExit(f'Invalid --video-path: {video_arg}')
+        # Explicit path must be in same account, not a different account.
+        if not inside(video,wd.parent):raise SystemExit('Video is outside the target account folder')
+        return video
+    own=safe_mp4_files(wd/'视频')
+    if len(own)==1:return own[0]
+    if len(own)>1:
+        raise SystemExit('Multiple MP4s in work/视频; pass --video-path explicitly')
+    parent=safe_mp4_files(wd.parent)
+    title=str(public_info.get('work_title') or wd.name).split('#',1)[0].strip()
+    clean=normalize_title(title)
+    if len(clean)<4:
+        raise SystemExit('Work title is too short to safely auto-match an account-root MP4; use --video-path')
+    # Downloader may truncate long filenames: a strong normalized title prefix
+    # identifies candidate(s) within the already-selected account directory.
+    prefix=clean[:min(len(clean),12)]
+    matches=[p for p in parent if prefix in normalize_title(p.stem)]
+    if len(matches)==1:
+        print('[VIDEO] Matched legacy MP4 in account directory by title prefix',flush=True)
+        return matches[0]
+    if not matches:
+        print('[VIDEO] Account-root MP4 candidates: '+(', '.join(p.name for p in parent) or '(none)'),flush=True)
+        raise SystemExit(f'No matching MP4 for work title {title!r}; add 视频/<file>.mp4 or pass --video-path')
+    raise SystemExit(f'Ambiguous account-root MP4 matches for {title!r}: '+
+                     ', '.join(p.name for p in matches)+'; pass --video-path')
+
+
 def digest(path):
     h=hashlib.sha256()
     with path.open('rb') as f:
@@ -59,23 +134,15 @@ def contact_sheet(images,seconds,indices,output,portrait):
 
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument('--work-dir',required=True,help='relative path under dy/reference')
+    ap.add_argument('--work-dir',required=True,help='relative per-work folder inside dy/reference')
     ap.add_argument('--root',default='.')
     ap.add_argument('--frame-mode',choices=['5','10','original'],default='5')
+    ap.add_argument('--video-path',default='',help='optional explicit repository-relative MP4 for ambiguous title matches')
     ap.add_argument('--out',default='evidence-output')
     args=ap.parse_args()
-    repo=Path(args.root).resolve();wd=(repo/args.work_dir).resolve();base=(repo/'dy/reference').resolve()
-    if not inside(wd,base) or wd==base or not wd.is_dir():
-        raise SystemExit('work_dir must exist under dy/reference, use a per-work folder')
+    repo=Path(args.root).resolve();base=(repo/'dy/reference').resolve()
+    wd=resolve_work_dir(repo,base,args.work_dir)
     if wd.is_symlink():raise SystemExit('work_dir symlinks not accepted')
-    video_dir=wd/'视频'
-    videos=[p for p in video_dir.glob('*') if p.is_file() and p.suffix.lower()=='.mp4' and not p.is_symlink()] if video_dir.exists() else []
-    if len(videos)!=1:raise SystemExit(f'Exactly one MP4 required inside {video_dir}; found {len(videos)}')
-    video=videos[0]
-    if not inside(video,wd):raise SystemExit('Video outside work directory')
-    with video.open('rb') as f:
-        if f.read(80).startswith(b'version https://git-lfs.github.com/spec/v1'):
-            raise SystemExit('Git LFS pointer downloaded instead of video')
     raw_info_path=wd/'作品信息_公开版.json'
     safe_dir=wd/'分析数据_公开版'
     if not raw_info_path.exists() or not safe_dir.is_dir():
@@ -83,6 +150,11 @@ def main():
     public_info=json.loads(raw_info_path.read_text(encoding='utf-8'))
     if public_info.get('schema_version')!='public_reference_v1':raise SystemExit('Unexpected public manifest schema')
     if not str(public_info.get('work_id','')).isdigit():raise SystemExit('Invalid work ID')
+    video=select_video(repo,base,wd,public_info,args.video_path)
+    print(f'[VIDEO] Selected: {video.relative_to(repo).as_posix()}',flush=True)
+    with video.open('rb') as f:
+        if f.read(80).startswith(b'version https://git-lfs.github.com/spec/v1'):
+            raise SystemExit('Git LFS pointer downloaded instead of video')
     # Hard whitelist: never package source's raw data, UID/CID, Cookie, settings or history.
     inp=safe_dir/'评论_匿名化.csv'
     with inp.open('r',encoding='utf-8-sig',newline='') as f:
@@ -99,7 +171,7 @@ def main():
     for name in ALLOWED_FILES:
         if not (safe_dir/name).is_file():raise SystemExit(f'Missing {name}')
     output=(repo/args.out).resolve()
-    if not inside(output,repo) or output==repo or output==wd or output.is_relative_to(wd):
+    if not inside(output,repo) or output==repo or output==wd or output.is_relative_to(wd) or wd.is_relative_to(output):
         raise SystemExit('Unsafe output directory')
     output.mkdir(parents=True,exist_ok=True)
     frame_dir=output/'frames';frame_dir.mkdir(exist_ok=True)
@@ -157,6 +229,7 @@ def main():
         'status':'evidence_not_ai_analysis',
         'work_id':public_info['work_id'],
         'source_video':video.relative_to(repo).as_posix(),
+        'source_work_dir':wd.relative_to(repo).as_posix(),
         'source_video_sha256':digest(video),
         'video_bytes':video.stat().st_size,
         'frame_mode':args.frame_mode,'frame_count':len(frames),
