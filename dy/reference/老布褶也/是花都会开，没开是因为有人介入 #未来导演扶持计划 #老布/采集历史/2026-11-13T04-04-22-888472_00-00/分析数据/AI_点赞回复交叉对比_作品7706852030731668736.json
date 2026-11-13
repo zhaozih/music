@@ -1,0 +1,72 @@
+{
+  "work_id": "7706852030731668736",
+  "status": "metrics_and_comment_text_only_no_semantic_ai_interpretation",
+  "summary": {
+    "raw_csv_rows": 0,
+    "unique_comments": 0,
+    "duplicate_rows_removed": 0,
+    "comments_with_like_count": 0,
+    "comments_missing_like_count": 0,
+    "comments_with_reply_count": 0,
+    "comments_missing_reply_count": 0,
+    "likes_min": null,
+    "likes_median": null,
+    "likes_max": null,
+    "likes_p75_high_threshold": null,
+    "likes_p95_cap": null,
+    "replies_min": null,
+    "replies_median": null,
+    "replies_max": null,
+    "replies_p75_high_threshold": null,
+    "replies_p95_cap": null,
+    "quadrant_counts_in_collected_sample": {
+      "高赞高回复": 0,
+      "高赞低回复": 0,
+      "低赞高回复": 0,
+      "低赞低回复": 0,
+      "指标缺失_不能分类": 0
+    },
+    "like_weight_rule": "1 + 2*min(ln(1+likes)/ln(1+likes_p95),1), with fallback 1",
+    "reply_weight_rule": "1 + 2*min(ln(1+replies)/ln(1+replies_p95),1), with fallback 1",
+    "weights_merged": false,
+    "ranked_likes_file": "AI_评论点赞排序_作品7706852030731668736.csv",
+    "ranked_replies_file": "AI_评论回复排序_作品7706852030731668736.csv",
+    "all_comments_verified": false,
+    "nested_replies_collected": false,
+    "reply_metric_interpretation": "Number of replies reported by platform, not contents or number of distinct repliers",
+    "confidence_note": "High replies are an interaction signal (debate, question, humor, conversation etc.); not automatic proof of dispute",
+    "ranked_comments_file": "AI_评论点赞排序_作品7706852030731668736.csv"
+  },
+  "thresholds": {
+    "definition": "75th percentile of NON-MISSING values in collected sample; high requires >0",
+    "likes_p75": null,
+    "replies_p75": null,
+    "warning": "Relative bins depend on returned sample and ties; NOT platform-wide rankings or representative proportions"
+  },
+  "quadrant_counts": {
+    "高赞高回复": 0,
+    "高赞低回复": 0,
+    "低赞高回复": 0,
+    "低赞低回复": 0,
+    "指标缺失_不能分类": 0
+  },
+  "top20_lists_overlap_count": 0,
+  "likes_rank_top20": [],
+  "replies_rank_top20": [],
+  "quadrant_examples": {
+    "高赞高回复": [],
+    "高赞低回复": [],
+    "低赞高回复": [],
+    "低赞低回复": [],
+    "指标缺失_不能分类": []
+  },
+  "interpretation_hypotheses_to_check": {
+    "高赞低回复": "可能更易获得快速认同、情绪共鸣或一句话总结；也可能因曝光排序产生，须读正文确认",
+    "低赞高回复": "可能是提问、讨论、争论、纠错、互动游戏或作者参与；不能只凭回复数认定有争议",
+    "高赞高回复": "可能兼具传播认可和持续讨论；要检查回复内容才知道讨论态度",
+    "低赞低回复": "可能较少曝光，也可能互动吸引力低；不可直接认定评论无价值",
+    "指标缺失_不能分类": "平台未返回至少一项指标，不参与高低比较"
+  },
+  "semantic_analysis_completed": false,
+  "nested_reply_texts_available": false
+}

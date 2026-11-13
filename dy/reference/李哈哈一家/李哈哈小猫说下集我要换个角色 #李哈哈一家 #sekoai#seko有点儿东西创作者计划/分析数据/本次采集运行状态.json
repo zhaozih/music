@@ -1,0 +1,8 @@
+{
+  "download_exit_code": 0,
+  "comments_exit_code": 0,
+  "comments_timeout": false,
+  "comment_page_limit": 200,
+  "comment_stage_timeout_seconds": 2400,
+  "notes": "无论是否超时，已有作品与媒体可归档；评论导出为0不能解释为作品没有评论。"
+}
