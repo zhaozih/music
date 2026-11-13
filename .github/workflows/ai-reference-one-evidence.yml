@@ -1,0 +1,60 @@
+name: AI Reference One Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      work_dir:
+        description: 'Repository-relative work directory under dy/reference, containing 视频/ and public analysis'
+        type: string
+        required: true
+        default: 'dy/reference/老布褶也/是花都会开，没开是因为有人介入'
+      frame_mode:
+        description: 'Frames per second'
+        type: choice
+        required: true
+        default: '5'
+        options:
+          - '5'
+          - '10'
+          - 'original'
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout including Git LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install FFmpeg + Pillow
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          python -m pip install 'Pillow>=10,<13'
+
+      - name: Package one work with allowlisted analysis data
+        env:
+          WORK_DIR: ${{ inputs.work_dir }}
+          FRAME_MODE: ${{ inputs.frame_mode }}
+        run: |
+          python scripts/build_one_evidence.py --work-dir "$WORK_DIR" --frame-mode "$FRAME_MODE" --out evidence-output
+
+      - name: Upload Actions artifact (no public Release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: one-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence-output/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
