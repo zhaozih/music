@@ -1,0 +1,167 @@
+name: AI Ksr Video Speech Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_path:
+        description: 'Repository-relative Git LFS MP4 path (one video only)'
+        required: true
+        type: string
+        default: 'dy/reference/Ksr桑/2026-11-13 18.32.02-视频-Ksr桑-新人入坑必看！原来AI视频还能这样... #即梦AI #ai教程 ##vibe知识大赏.mp4'
+      frame_fps:
+        description: 'Preview frames per second'
+        required: true
+        type: choice
+        default: '1'
+        options: ['1', '2']
+      asr_model:
+        description: 'Whisper ASR model: small=quick, medium=more accurate/slower'
+        required: true
+        type: choice
+        default: 'small'
+        options: ['small', 'medium']
+
+permissions:
+  contents: read
+
+jobs:
+  extract-and-transcribe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout LFS video
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          persist-credentials: false
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          python -m pip install --quiet 'Pillow>=10,<13' 'faster-whisper>=1.1,<2'
+
+      - name: Extract video, speech and indexed frames
+        env:
+          VIDEO_PATH: ${{ inputs.video_path }}
+          FRAME_FPS: ${{ inputs.frame_fps }}
+          ASR_MODEL: ${{ inputs.asr_model }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, hashlib, json, math, os, pathlib, re, subprocess, traceback
+          from PIL import Image, ImageDraw, ImageFont, ImageOps
+          root = pathlib.Path.cwd().resolve()
+          relative = pathlib.Path(os.environ['VIDEO_PATH'])
+          if relative.is_absolute() or '..' in relative.parts or relative.suffix.lower() != '.mp4':
+              raise SystemExit('Unsafe MP4 path')
+          source = (root / relative).resolve()
+          if not source.is_relative_to(root) or not source.is_file():
+              raise SystemExit('MP4 not found in repository checkout')
+          with source.open('rb') as f:
+              if f.read(80).startswith(b'version https://git-lfs.github.com/spec/v1'):
+                  raise SystemExit('LFS pointer only; actual video was not downloaded')
+          out = root / 'ksr-speech-output'
+          frames = out / 'frames'
+          sheets = out / 'contact_sheets'
+          frames.mkdir(parents=True, exist_ok=True)
+          sheets.mkdir(parents=True, exist_ok=True)
+          def run(*args, **kwargs):
+              subprocess.run(args, check=True, **kwargs)
+          with (out/'metadata.json').open('wb') as f:
+              run('ffprobe','-v','error','-show_entries','format=duration,size:stream=codec_type,codec_name,width,height','-of','json',str(source),stdout=f)
+          metadata = json.loads((out/'metadata.json').read_text())
+          duration = float(metadata.get('format',{}).get('duration',0) or 0)
+          video = next((v for v in metadata.get('streams',[]) if v.get('codec_type')=='video'),None)
+          if video is None: raise SystemExit('No video track')
+          sha = hashlib.sha256()
+          with source.open('rb') as f:
+              for chunk in iter(lambda:f.read(1024*1024),b''): sha.update(chunk)
+          fps = int(os.environ['FRAME_FPS'])
+          video_filter = f'fps={fps},scale=960:-2,showinfo'
+          with (out/'frames-ffmpeg.log').open('wb') as err:
+              run('ffmpeg','-y','-hide_banner','-nostats','-loglevel','info','-i',str(source),
+                  '-map','0:v:0','-vf',video_filter,'-fps_mode','passthrough',
+                  '-start_number','0','-q:v','4',str(frames/'frame_%06d.jpg'),stderr=err)
+          paths = sorted(frames.glob('frame_*.jpg'))
+          if not paths or len(paths)>12000:raise SystemExit('Invalid frame count; select 1 FPS or split video')
+          regex = re.compile(r'\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:\s*([-+\d.eE]+)')
+          times={}
+          for ln in (out/'frames-ffmpeg.log').read_text(errors='replace').splitlines():
+              m=regex.search(ln)
+              if m: times[int(m.group(1))]=float(m.group(3))
+          if set(times)!=set(range(len(paths))):raise SystemExit(f'Frame timestamps missing: {len(times)} vs {len(paths)}')
+          base_time=times[0]
+          with (out/'frame-index.csv').open('w',newline='',encoding='utf-8-sig') as f:
+              w=csv.writer(f);w.writerow(['frame_file','seconds_from_first_frame','pts_seconds'])
+              for i,p in enumerate(paths):w.writerow([p.name,round(times[i]-base_time,3),times[i]])
+          landscape=video.get('width',0)>=video.get('height',0)
+          tw,th=(480,310) if landscape else (330,490)
+          font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',18)
+          def sheet(indices,target):
+              canvas=Image.new('RGB',(tw*3,th*3),'#14151a')
+              draw=ImageDraw.Draw(canvas)
+              for k,i in enumerate(indices):
+                  x=(k%3)*tw; y=(k//3)*th
+                  with Image.open(paths[i]) as im:thumb=ImageOps.contain(im.convert('RGB'),(tw-12,th-42))
+                  canvas.paste(thumb,(x+(tw-thumb.width)//2,y+4))
+                  draw.text((x+7,y+th-30),f'{times[i]-base_time:.1f}s',fill='white',font=font)
+              canvas.save(target,quality=80)
+          for j in range(0,len(paths),9):sheet(range(j,min(j+9,len(paths))),sheets/f'sheet_{j//9+1:04d}.jpg')
+          overview=sorted(set(round(i*(len(paths)-1)/8) for i in range(9))) if len(paths)>1 else [0]
+          sheet(overview,out/'overview.jpg')
+          (out/'frames-ffmpeg.log').unlink(missing_ok=True)
+          has_audio=any(x.get('codec_type')=='audio' for x in metadata.get('streams',[]))
+          asr_status='no_audio'
+          if has_audio:
+              run('ffmpeg','-y','-v','error','-i',str(source),'-map','0:a:0','-vn','-c:a','aac','-b:a','128k',str(out/'audio.m4a'))
+              run('ffmpeg','-y','-v','error','-i',str(source),'-map','0:a:0','-vn','-ar','16000','-ac','1',str(out/'audio16k.wav'))
+              try:
+                  from faster_whisper import WhisperModel
+                  model=WhisperModel(os.environ['ASR_MODEL'],device='cpu',compute_type='int8',cpu_threads=4)
+                  segments, info=model.transcribe(str(out/'audio16k.wav'),language='zh',beam_size=5,
+                       vad_filter=True,condition_on_previous_text=False)
+                  collected=[]
+                  for seg in segments:
+                      text=seg.text.strip()
+                      if text:collected.append({'start':round(seg.start,3),'end':round(seg.end,3),'text':text})
+                  (out/'transcript.json').write_text(json.dumps({'language':'zh','model':os.environ['ASR_MODEL'],
+                       'verified_by_human':False,'segments':collected},ensure_ascii=False,indent=2),encoding='utf-8')
+                  def hhmmss(t):
+                      ms=round(t*1000);h,ms=divmod(ms,3600000);m,ms=divmod(ms,60000);s,ms=divmod(ms,1000)
+                      return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
+                  with (out/'transcript.srt').open('w',encoding='utf-8-sig') as f:
+                      for i,seg in enumerate(collected,1):
+                          f.write(f"{i}\n{hhmmss(seg['start'])} --> {hhmmss(seg['end'])}\n{seg['text']}\n\n")
+                  with (out/'transcript.txt').open('w',encoding='utf-8-sig') as f:
+                      f.write('机器语音转写草稿：可能存在漏字/错字，需结合画面音频核对。\n\n')
+                      for seg in collected:f.write(f"[{seg['start']:8.1f} - {seg['end']:8.1f}] {seg['text']}\n")
+                  asr_status='completed_unverified'
+              except Exception as err:
+                  (out/'transcription_error.txt').write_text(f'{type(err).__name__}: {err}\n',encoding='utf-8')
+                  asr_status='failed'
+              (out/'audio16k.wav').unlink(missing_ok=True)
+          manifest={'source_path':relative.as_posix(),'source_sha256':sha.hexdigest(),
+                    'source_bytes':source.stat().st_size,'duration_seconds':duration,
+                    'frame_fps':fps,'frame_count':len(paths),'asr_status':asr_status,
+                    'asr_model':os.environ['ASR_MODEL'],'transcript_is_machine_generated':True,
+                    'frames_are_real_video_samples':True,'speech_requires_audio_review':True}
+          (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(manifest,ensure_ascii=False),flush=True)
+          PY
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksr-speech-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ksr-speech-output/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
