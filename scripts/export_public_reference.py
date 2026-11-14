@@ -3,11 +3,13 @@
 """Local Windows/Linux pre-publication export of Douyin Collector V5.8.10 works.
 
 Only allowlisted columns are exported. This cannot guarantee anonymity of prose or video.
-V1.2: a missing or ambiguous video no longer aborts unrelated works; summary report added.
+V1.4: recover available comment metrics, diagnose missing source columns and preserve zero values.
 DO NOT upload original collector folders or the originals of CSV/JSON/ZIP.
 """
 import argparse
 import csv
+import collections
+import math
 import json
 import re
 import unicodedata
@@ -34,28 +36,72 @@ def text_file(path):
     raise ValueError(f'Unable to decode {path}')
 
 
+# Exact, comment-level metric aliases. A work's overall likes are NEVER used as comment likes.
+LIKE_ALIASES = ('digg_count','diggcount','comment_likes','like_count','likes',
+    '点赞数','点赞量','点赞数量','获赞数','获赞量','评论点赞数','评论获赞数')
+REPLY_ALIASES = ('reply_comment_total','replycommenttotal','replies_reported',
+    'reply_count','replies','回复数','回复数量','回复量','评论回复数','子评论数')
+TEXT_ALIASES = ('text','content','评论内容','评论文本')
+CID_ALIASES = ('cid','comment_id','评论id')
+DATE_ALIASES = ('create_time','create_timestamp','评论时间','发布时间')
+
+
+def norm_header(value):
+    return re.sub(r'[\s_\-]+','',unicodedata.normalize('NFKC',str(value or '').lstrip('\ufeff')).casefold())
+
+
 def read_csv(path):
     content = text_file(path)
-    return list(csv.DictReader(content.splitlines()))
+    # CSV and TSV from older official releases; do not split lines before the parser
+    # because quoted comment text may contain embedded line breaks.
+    preview = content[:4096]
+    delim = '\t' if preview.count('\t') > preview.count(',') else ','
+    return list(csv.DictReader(__import__('io').StringIO(content,newline=''),delimiter=delim))
 
 
-def field(row, keys, default=''):
-    mapped = {str(k).strip().lower().replace(' ', ''):v for k,v in row.items() if k}
-    for key in keys:
-        value=mapped.get(key.lower())
-        if value is not None and str(value).strip():
+def field(row,keys,default=''):
+    mapped={norm_header(k):v for k,v in row.items() if k is not None}
+    for name in keys:
+        value=mapped.get(norm_header(name))
+        if value is not None and str(value).strip()!='':
             return str(value).strip()
     return default
 
 
-def count(value):
-    if value is None: return ''
-    value=str(value).strip()
-    if not value or value in ('-1','None','null'): return ''
-    if value.isdecimal(): return value
-    # Support only unambiguous simple numeric values
+def has_col(columns,aliases):
+    names={norm_header(c) for c in columns if c is not None}
+    return any(norm_header(alias) in names for alias in aliases)
+
+
+def known_columns(columns,aliases):
+    whitelist={norm_header(alias) for alias in aliases}
+    return [str(name) for name in columns if norm_header(name) in whitelist]
+
+
+def metric_value(row,aliases):
+    # Some snapshots have both an empty official column and a populated
+    # alternate column. Search until a *valid* number is found, including 0.
+    normalized={norm_header(k):v for k,v in row.items() if k is not None}
+    for alias in aliases:
+        key=norm_header(alias)
+        if key in normalized:
+            n=count(normalized[key])
+            if n!='':return n
     return ''
 
+
+def count(value):
+    """Metric parser preserving true 0 and missingness; no invented values."""
+    if value is None or isinstance(value,bool):return ''
+    s=unicodedata.normalize('NFKC',str(value)).strip().replace(',','').replace('，','')
+    if s.casefold() in ('','-1','none','null','nan','n/a','-','未知'):return ''
+    if re.fullmatch(r'\d+',s):return s
+    # Platform UI shorthand is an approximation, not an exact count.
+    m=re.fullmatch(r'(\d+(?:\.\d+)?)\s*([万千亿])',s)
+    if m:
+        result=float(m.group(1))*{'千':1000,'万':10000,'亿':100000000}[m.group(2)]
+        if math.isfinite(result):return str(int(result))
+    return ''
 
 def clean_name(s, fallback):
     s = BAD.sub('_', str(s or '')).strip().strip('. ')
@@ -97,43 +143,128 @@ def read_json(path):
     except (json.JSONDecodeError,UnicodeError): return {}
 
 
-def collect_comments(work):
+def _comment_sources(work):
+    """Current raw + current derived, then older snapshots for backfill only."""
     raw=work/'原始数据'
-    files=sorted(p for p in raw.rglob('*.csv') if '评论' in p.stem or 'comment' in p.stem.lower()) if raw.exists() else []
-    if not files:
-        a=work/'分析数据'
-        if a.exists():
-            files=sorted(p for p in a.glob('AI_评论点赞排序*.csv'))
-    comments={}
-    flagged=0
-    for f in files:
-        for row in read_csv(f):
-            body=field(row,('text','content','评论内容','评论文本'))
-            if not body:continue
-            red,flags=redact(body)
-            if flags:flagged+=1
-            raw_cid=field(row,('cid','comment_id','评论id'))
-            ct=field(row,('create_time','create_timestamp','评论时间','发布时间'))
-            key=('cid',raw_cid) if raw_cid else ('text',body,ct)
-            item={
-                'text':red,
-                'comment_likes':count(field(row,('digg_count','comment_likes','like_count','likes','点赞数'))),
-                'reply_count':count(field(row,('reply_comment_total','replies_reported','reply_count','回复数'))),
-                'comment_date':ct[:10] if ct else '',
-                'redaction_flags':';'.join(flags),
-            }
-            if key not in comments:
-                comments[key]=item
-            else:
-                prior=comments[key]
-                for m in ('comment_likes','reply_count'):
-                    if item[m] and (not prior[m] or int(item[m])>int(prior[m])):
-                        prior[m]=item[m]
-    rows=list(comments.values())
-    rows.sort(key=lambda r: (-(int(r['comment_likes'] or 0)), -(int(r['reply_count'] or 0)),r['text']))
-    for i,row in enumerate(rows,1):row['sample_id']=f'C{i:06d}'
-    return rows,flagged,files
+    ana=work/'分析数据'
+    files=[]
+    if raw.is_dir():
+        files += [('raw_current',p) for p in sorted(raw.rglob('*.csv'))
+                  if ('评论' in p.stem or 'comment' in p.stem.lower())]
+    if ana.is_dir():
+        files += [('analysis_current',p) for p in sorted(ana.glob('AI_评论*排序*.csv'))]
+    history=work/'采集历史'
+    if history.is_dir():
+        files += [('history',p) for p in sorted(history.rglob('*.csv'))
+                  if ('评论' in p.stem or 'comment' in p.stem.lower())]
+    return files
 
+
+def _source_diagnosis(label, columns, rows, path):
+    """Only aggregates/column names; NEVER expose commenter IDs or personal text."""
+    countlike=sum(metric_value(r,LIKE_ALIASES)!='' for r in rows)
+    countreply=sum(metric_value(r,REPLY_ALIASES)!='' for r in rows)
+    zero_likes=sum(metric_value(r,LIKE_ALIASES)=='0' for r in rows)
+    zero_replies=sum(metric_value(r,REPLY_ALIASES)=='0' for r in rows)
+    return {'file_type':label,'file_name':path.name,'csv_rows':len(rows),
+        'detected_like_columns':known_columns(columns,LIKE_ALIASES),
+        'detected_reply_columns':known_columns(columns,REPLY_ALIASES),
+        'other_column_count':max(0,len(columns)-len(known_columns(columns,LIKE_ALIASES))-len(known_columns(columns,REPLY_ALIASES))),
+        'has_comment_like_column':has_col(columns,LIKE_ALIASES),
+        'has_comment_reply_column':has_col(columns,REPLY_ALIASES),
+        'likes_valid_rows':countlike,'replies_valid_rows':countreply,
+        'likes_actual_zero_rows':zero_likes,'replies_actual_zero_rows':zero_replies}
+
+
+def metric_issue(source_info, known,kind):
+    if known:return 'AVAILABLE'
+    if not source_info:return 'NO_COMMENT_SOURCES'
+    key='has_comment_like_column' if kind=='like' else 'has_comment_reply_column'
+    if not any(x.get(key) for x in source_info):return 'SOURCE_COLUMN_NOT_FOUND'
+    return 'ALL_SOURCE_VALUES_MISSING_OR_INVALID'
+
+
+def collect_comments(work):
+    """Reconcile raw rows and existing generated rankings by CID/text where unambiguous.
+
+    A missing metric never overrides a valid 0 or a positive value. History can
+    fill a value on an already existing comment, but cannot invent fresh comments.
+    """
+    files=_comment_sources(work)
+    comments={}; by_text=collections.defaultdict(set)
+    flagged=0; diagnostics=[]; sources_used=[]
+    history_recovered=0
+    for source_type,path in files:
+        rows=read_csv(path)
+        columns=list(rows[0].keys()) if rows else []
+        if not columns:
+            with path.open('r',encoding='utf-8-sig',errors='replace') as f:
+                columns=next(csv.reader(f),[])
+        diagnostics.append(_source_diagnosis(source_type,columns,rows,path))
+        sources_used.append(path)
+        for row in rows:
+            body=field(row,TEXT_ALIASES)
+            if not body:continue
+            cid=field(row,CID_ALIASES)
+            date=field(row,DATE_ALIASES)
+            like=metric_value(row,LIKE_ALIASES)
+            reply=metric_value(row,REPLY_ALIASES)
+            ident=('cid',cid) if cid else ('text',body,date)
+            existing=comments.get(ident)
+            if existing is None:
+                # Exact text and compatible date can bridge raw and AI-derived rows;
+                # two distinct known CIDs are never joined solely by text.
+                matches=[key for key in by_text.get(body,set())
+                         if (not cid or not comments[key]['_cid'] or comments[key]['_cid']==cid)
+                         and (not date or not comments[key]['_date'] or
+                              comments[key]['_date']==date)]
+                if len(matches)==1:
+                    existing=comments[matches[0]]
+            if existing is None:
+                if source_type=='history':
+                    continue  # old comments not in current snapshot cannot enter export
+                red,flags=redact(body)
+                if flags:flagged+=1
+                existing={'text':red,'comment_likes':'','reply_count':'',
+                    'comment_date':date[:10] if date else '',
+                    'redaction_flags':';'.join(flags),
+                    '_cid':cid,'_date':date,'_source_like':'','_source_reply':''}
+                comments[ident]=existing
+                by_text[body].add(ident)
+            elif cid and not existing['_cid']:
+                existing['_cid']=cid
+                comments[('cid',cid)]=existing
+                by_text[body].add(('cid',cid))
+            for output_key,new_value,provenance in [('comment_likes',like,'_source_like'),
+                    ('reply_count',reply,'_source_reply')]:
+                old=existing[output_key]
+                if new_value!='' and (old=='' or (source_type!='history' and int(new_value)>int(old))):
+                    if source_type=='history':history_recovered+=1
+                    existing[output_key]=new_value
+                    existing[provenance]=source_type
+    # Alias keys may point to the same record; use object identity for deduplication.
+    seen=set(); output=[]
+    for item in comments.values():
+        if id(item) in seen:continue
+        seen.add(id(item));output.append(item)
+    output.sort(key=lambda r: (r['comment_likes']=='',-int(r['comment_likes'] or 0),
+        r['reply_count']=='',-int(r['reply_count'] or 0),r['text']))
+    for i,row in enumerate(output,1):
+        row['sample_id']=f'C{i:06d}'
+    valid_likes=sum(c['comment_likes']!='' for c in output)
+    valid_replies=sum(c['reply_count']!='' for c in output)
+    audit={'comments_exported':len(output),
+        'comment_likes_known':valid_likes,'comment_replies_known':valid_replies,
+        'likes_actual_zero_count':sum(r['comment_likes']=='0' for r in output),
+        'replies_actual_zero_count':sum(r['reply_count']=='0' for r in output),
+        'likes_issue':metric_issue(diagnostics,valid_likes,'like'),
+        'replies_issue':metric_issue(diagnostics,valid_replies,'reply'),
+        'history_metric_backfills':history_recovered,
+        'source_diagnostics':diagnostics,
+        'analysis_notice':'字段存在不代表值可用；0是真实记录的0，-1/空字符串是缺失。历史数据若补值，可能与本次快照时间不同。',
+        'raw_personal_identifiers_exported':False}
+    # No personal data ever added to the published CSV/diagnostics.
+    return output,flagged,sources_used,audit
 
 def choose_destination(outroot, account, title, work_id):
     """Reuse the same work-ID destination; disambiguate duplicate titles."""
@@ -192,10 +323,11 @@ def export_work(work,outroot,include_video=False):
     (dest/'作品信息_公开版.json').write_text(json.dumps(safe_info,ensure_ascii=False,indent=2),encoding='utf-8')
     sub=dest/'分析数据_公开版'
     sub.mkdir(exist_ok=True)
-    rows, flagged, files=collect_comments(work)
+    rows, flagged, files, audit=collect_comments(work)
+    (sub/'评论字段诊断_公开版.json').write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf-8')
     cols=['sample_id','text','comment_likes','reply_count','comment_date','redaction_flags']
     with (sub/'评论_匿名化.csv').open('w',encoding='utf-8-sig',newline='') as fp:
-        writer=csv.DictWriter(fp,fieldnames=cols)
+        writer=csv.DictWriter(fp,fieldnames=cols,extrasaction='ignore')
         writer.writeheader();writer.writerows(rows)
     stats={
         'sample_count':len(rows),
@@ -204,6 +336,10 @@ def export_work(work,outroot,include_video=False):
         'top_comment_likes':max([int(c['comment_likes']) for c in rows if c['comment_likes']!=''],default=None),
         'top_comment_replies':max([int(c['reply_count']) for c in rows if c['reply_count']!=''],default=None),
         'metrics_as_reported':safe_info['metrics_as_reported'],
+        'comment_likes_status':audit['likes_issue'],
+        'comment_replies_status':audit['replies_issue'],
+        'comment_likes_true_zero_rows':audit['likes_actual_zero_count'],
+        'comment_replies_true_zero_rows':audit['replies_actual_zero_count'],
         'caution':'点赞高不等于认同；回复多不等于争议；评论覆盖范围未知',
     }
     (sub/'互动数据_公开版.json').write_text(json.dumps(stats,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -212,6 +348,8 @@ def export_work(work,outroot,include_video=False):
         problems.append('找不到该作品的原始评论 CSV 或点赞榜 CSV；导出空评论表，不能理解为作品没有评论')
     elif not rows:
         problems.append('找到了评论数据文件但未提取到可分析的评论正文；需检查原始采集结果')
+    elif audit['comment_likes_known']==0 or audit['comment_replies_known']==0:
+        problems.append('评论互动指标缺口：点赞'+audit['likes_issue']+'；回复'+audit['replies_issue']+'。已保留评论正文，未将缺失值填0。')
     copied=0
     if include_video:
         videos,warning=video_candidates(work)
@@ -246,6 +384,10 @@ def export_work(work,outroot,include_video=False):
         'work_folder':dest.relative_to(outroot).as_posix(),
         'status':'PARTIAL' if problems else 'OK',
         'comments_exported':len(rows),
+        'comment_likes_known':audit['comment_likes_known'],
+        'comment_replies_known':audit['comment_replies_known'],
+        'likes_issue':audit['likes_issue'],
+        'replies_issue':audit['replies_issue'],
         'comment_sources':len(files),
         'video_copied':copied,
         'warnings':problems,
@@ -270,7 +412,7 @@ def write_batch_report(out, items, source_count, include_video):
     folder.mkdir(parents=True,exist_ok=True)
     statuses={k:sum(row['status']==k for row in items) for k in ('OK','PARTIAL','FAILED')}
     summary={
-        'version':'public_reference_export_v1.2',
+        'version':'public_reference_export_v1.4',
         'generated_utc':datetime.now(timezone.utc).isoformat(),
         'works_discovered':source_count,
         'works_processed':len(items),
@@ -278,12 +420,14 @@ def write_batch_report(out, items, source_count, include_video):
         'partial':statuses['PARTIAL'],
         'failed':statuses['FAILED'],
         'comments_exported_total':sum(row['comments_exported'] for row in items),
+        'comments_with_likes_total':sum(row.get('comment_likes_known',0) for row in items),
+        'comments_with_replies_total':sum(row.get('comment_replies_known',0) for row in items),
         'videos_copied_total':sum(row['video_copied'] for row in items),
         'video_copy_requested':include_video,
         'note':'只代表成功发现的作品目录和已抓取评论，不代表账号全量作品或全量评论。PARTIAL 也生成了数据。',
     }
     (folder/'导出汇总.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-    fields=['status','account','work_folder','work_id','comments_exported','comment_sources','video_copied','warnings']
+    fields=['status','account','work_folder','work_id','comments_exported','comment_likes_known','comment_replies_known','likes_issue','replies_issue','comment_sources','video_copied','warnings']
     with (folder/'逐作品导出清单.csv').open('w',encoding='utf-8-sig',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore')
         writer.writeheader()
@@ -294,7 +438,7 @@ def write_batch_report(out, items, source_count, include_video):
     lines=[
         '导出汇总（不代表抖音平台全量数据）',
         f'识别作品 {source_count}，正常 {statuses["OK"]}，部分成功 {statuses["PARTIAL"]}，失败 {statuses["FAILED"]}',
-        f'导出评论 {summary["comments_exported_total"]} 条，复制视频 {summary["videos_copied_total"]} 个',
+        f'导出评论 {summary["comments_exported_total"]} 条，点赞值有效 {summary["comments_with_likes_total"]} 条，回复值有效 {summary["comments_with_replies_total"]} 条，复制视频 {summary["videos_copied_total"]} 个',
         '',
     ]
     for item in items:
@@ -307,7 +451,7 @@ def write_batch_report(out, items, source_count, include_video):
 
 
 def main():
-    p=argparse.ArgumentParser(description='V1.2: batch and privacy-minimized Douyin reference export')
+    p=argparse.ArgumentParser(description='V1.4: audited comment metric recovery and privacy-minimized export')
     p.add_argument('--source',required=True,help='采集成果 / 一个账号目录 / 一个作品目录')
     p.add_argument('--output',required=True,help='独立的公开版导出目录')
     p.add_argument('--include-video',action='store_true',help='尽量复制每条作品的视频；缺失时仍继续脱敏所有作品')
@@ -333,11 +477,15 @@ def main():
                 'work_id':'',
                 'comments_exported':0,
                 'comment_sources':0,
+                'comment_likes_known':0,
+                'comment_replies_known':0,
+                'likes_issue':'WORK_EXPORT_FAILED',
+                'replies_issue':'WORK_EXPORT_FAILED',
                 'video_copied':0,
                 'warnings':[f'{type(e).__name__}: {e}'],
             }
         items.append(item)
-        print(f'  {item["status"]}: {item["work_folder"]} | 评论 {item["comments_exported"]} | 视频 {item["video_copied"]}',flush=True)
+        print(f'  {item["status"]}: {item["work_folder"]} | 评论 {item["comments_exported"]} | 有点赞数 {item.get("comment_likes_known",0)} | 有回复数 {item.get("comment_replies_known",0)} | 视频 {item["video_copied"]}',flush=True)
         for warning in item['warnings']:
             print('  提示：'+warning,flush=True)
     summary=write_batch_report(out,items,len(works),args.include_video)
