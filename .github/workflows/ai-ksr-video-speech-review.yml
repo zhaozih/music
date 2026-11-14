@@ -44,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
-          python -m pip install --quiet 'Pillow>=10,<13' 'faster-whisper>=1.1,<2'
+          python -m pip install --quiet 'Pillow>=10,<13' 'faster-whisper>=1.1,<2' 'av>=11,<19'
 
       - name: Extract video, speech and indexed frames
         env:
@@ -154,6 +154,8 @@ jobs:
                     'frames_are_real_video_samples':True,'speech_requires_audio_review':True}
           (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
           print(json.dumps(manifest,ensure_ascii=False),flush=True)
+          if asr_status == 'failed':
+              raise SystemExit('ASR failed; see transcription_error.txt in uploaded artifact')
           PY
 
       - name: Upload evidence artifact
